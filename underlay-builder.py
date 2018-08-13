@@ -7,12 +7,15 @@ import jsonrpclib
 
 
 class Link(object):
-    def __init__(self, local_int, ip, cidr):
+    def __init__(self, local_int, ip, cidr, neighbor_ip, neighbor_asn):
         self.local_int = local_int
         self.ip = ip
         self.cidr = cidr
+        self.neighbor_ip = neighbor_asn
+        self.neighbor_asn = neighbor_asn
     def __str__(self):
-        return '%s %s %s' % (self.local_int, self.ip, self.cidr)
+        return '%s %s %s %s %s' % (self.local_int, self.ip, self.cidr,
+                             self.neighbor_ip, self.neighbor_asn)
 
 def get_credentials(ztp=cvp_vars.getValue(cvp_names.ZTP_STATE)):
     if ztp == 'true':
@@ -77,18 +80,25 @@ def build_pools(session, pool_id):
     network_pools = get_pools(session, pool_id)['data']
     for item in network_pools:
         if item['children'] == 'none':
-            print 'Children equal none'
             name = item['name']
-            print name
             pools[name] = item
         elif item['children'] != 'none':
             _network_pools = build_pools(session, item['id'])
             pools.update(_network_pools)
     return pools
 
-def build_links(session, hostname, systems, lldp_info, pools):
+def build_asns(session):
+    asns = dict()
+    asn_info = get_network_allocations(session, 'underlay', 'asns')['data']
+    for asn in asn_info:
+        hosts = asn['description'].split('|')
+        for host in hosts:
+            asns[host] = asn['value']
+    return asns
+
+def build_links(session, hostname, systems, lldp_info, pools, asns):
     links = dict()
-    links['%s_routerid' % hostname] = Link('Loopback0', '', '')
+    links['%s_routerid' % hostname] = Link('Loopback0', '', '', '', '')
 
     for key in sorted(lldp_info.keys()):
         if len(lldp_info[key]['lldpNeighborInfo']) == 0:
@@ -99,7 +109,7 @@ def build_links(session, hostname, systems, lldp_info, pools):
         if mac not in systems.keys():
             continue
         neigh_hostname = systems[mac]
-        link = Link(key, '', '')
+        link = Link(key, '', '', '', asns[neigh_hostname])
         if 'leaf' in hostname and 'spine' in neigh_hostname:
             link_name = '%s_%s' % (neigh_hostname, hostname)
         elif 'spine' in hostname and 'leaf' in neigh_hostname:
@@ -114,11 +124,16 @@ def build_links(session, hostname, systems, lldp_info, pools):
             cidr = subnet.prefixlen
             if 'routerid' in key:
                 ip = subnet[0]
+                neigh_ip = ''
             elif 'leaf' in hostname:
                 ip = subnet[2]
+                neigh_ip = subnet[1]
             elif 'spine' in hostname:
                 ip = subnet[1]
+                neigh_ip = subnet[2]
+            
             links[key].ip = ip
+            links[key].neighbor_ip = neigh_ip
             links[key].cidr = cidr
     
     return links
@@ -130,16 +145,15 @@ systems = get_systems(session)
 sys_hostname = systems[sys_mac]
 neighbors = send_commands(['show lldp neighbors detail'])[0]
 pools = build_pools(session, 'underlay-ipv4')
+asns = build_asns(session)
+sys_asn = asns[sys_hostname]
 
-# Physical Interfaces Used for Peering
-links = build_links(session, sys_hostname, systems, neighbors['lldpNeighbors'], pools)
+# build all link info for routed ports and bgp
+links = build_links(session, sys_hostname, systems, 
+                    neighbors['lldpNeighbors'], pools, asns)
 
-# Get ASNS
-asns = get_network_allocations(session, 'underlay', 'asns')['data']
-for asn in asns:
-    if sys_hostname in asn['description']:
-        sys_asn = asn['value']
-
+loopback = links['%s_routerid' % sys_hostname]
+del links['%s_routerid' % sys_hostname]
 
 print 'ip routing'
 print '!'
@@ -147,18 +161,18 @@ for key in sorted(links.keys()):
     link = links[key]
     print 'interface %s' % link.local_int
     print '   description %s' % key
-    if 'Loopback' not in link.local_int:
-      print '   no switchport'
+    print '   no switchport'
     print '   ip address %s/%s' % (link.ip, link.cidr)
     print '!'
-
-print 'router bgp %s' % sys_asn
-print '   router-id %s' % links['%s_routerid' % sys_hostname].ip
+print 'interface %s' % loopback.local_int
+print '   description %s_routerid' % sys_hostname
+print '   ip address %s/%s' % (loopback.ip, loopback.cidr)
 print '!'
 
-
-
-
-
-
-
+print 'router bgp %s' % sys_asn
+print '   router-id %s' % loopback.ip
+for key in sorted(links.keys()):
+    link = links[key]
+    print '   neighbor %s remote-as %s' % (link.neighbor_ip, link.neighbor_asn)
+print '   network %s/%s' % (loopback.ip, loopback.cidr)
+print '!'
